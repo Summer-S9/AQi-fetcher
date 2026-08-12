@@ -1,0 +1,29 @@
+# ── 敏感凭证:登录会话(cookie/token),绝不入库 ──
+data/fetcher/sessions/
+*.cookie
+*.token
+*.key
+
+# ── 数据:实时库与接口存档(含平台返回的 token 等字段,不公开) ──
+data/sq_metrics.db
+data/*.db
+data/*.db-journal
+
+# ── 快照:导出数据(仅本地/主项目使用,不公开) ──
+export/
+
+# ── Python ──
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
+
+# ── 临时 ──
+*.tmp
+*.log
+/tmp/

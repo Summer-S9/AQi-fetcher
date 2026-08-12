@@ -1,0 +1,180 @@
+# AQi-fetcher — SF (Super Fetcher) v1.0 数据采集项目
+
+AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书创作后台自动抓取
+真实数据,统一入库,并通过**带时间戳的快照**单向供给 AQi-channel 盲测项目使用。
+
+> **本工作区与 AQi-channel 物理隔离**。实时数据库、登录会话、接口存档都在这里;
+> AQi-channel 内只有快照文件。任何 agent 在 AQi-channel 做盲测/复盘时
+> **禁止读取本工作区**,防止真实数据污染模型迭代。
+
+---
+
+## 1. 项目定位
+
+| 项 | 说明 |
+|---|---|
+| 全称 | SF (Super Fetcher) v1.0 |
+| 工作区 | `~/AQi-fetcher/` |
+| 服务对象 | AQi-channel(盲测/复盘/报告) |
+| 数据源 | B站创作中心 / 抖音创作者中心 / 小红书创作服务平台 |
+| 产出 | SQLite 实时库 + 时间戳快照(JSON/XLSX) |
+| 核心原则 | **隔离**:主项目只见快照,不见实时库 |
+
+## 2. 目录结构
+
+```
+~/AQi-fetcher/
+├── SF/                         # SF v1.0 采集器代码
+│   ├── sf_core.py              # 核心库:DB 连接/字段标准化/T+7 判定/导出
+│   ├── sf_fetch.py             # CLI 入口(login/fetch/status/export)
+│   ├── sf_login.py             # 三平台登录(浏览器扫码,保存会话)
+│   ├── sf_bilibili.py          # B站抓取器
+│   ├── sf_douyin.py            # 抖音抓取器
+│   ├── sf_xiaohongshu.py       # 小红书抓取器(列表+深度)
+│   ├── xhs_audit.py            # 小红书全量校验(DB vs 原始存档)
+│   ├── xhs_reparse.py          # 小红书重解析(从存档恢复,修复入库)
+│   ├── sf_push.py              # 导出快照并推送主项目(唯一出口)
+│   ├── build-sf-report.py      # 采集成果 Word 报告生成器
+│   └── report_lib_v4.py        # Word 视觉库(复用主项目)
+├── data/
+│   ├── sq_metrics.db           # 主数据库(SQLite,真实后台数据)
+│   └── fetcher/sessions/       # 三平台登录会话(bilibili/douyin/xiaohongshu.json)
+├── export/                     # 快照输出(带时间戳,供推送)
+├── README.md                   # 本文件
+├── AGENTS.md                   # 项目内 agent 行为规范(必读)
+└── VERSION_HISTORY.md          # 版本迭代报告(迭代后必更)
+```
+
+## 3. 数据流(单向)
+
+```
+平台创作后台
+   │  (浏览器会话,Playwright 拦截接口)
+   ▼
+SF 抓取器 ──► sq_metrics.db(独立工作区,实时库)
+                  │
+                  │  sf_push.py(导出 JSON/XLSX,带时间戳)
+                  ▼
+           export/sq_metrics_YYYYMMDD_HHMM.{json,xlsx}
+                  │  拷入(手动或推送脚本)
+                  ▼
+    AQi-channel/data/fetcher/snapshots/  ← 主项目唯一数据源
+                  │
+                  ▼
+           盲测/复盘/报告(只读快照)
+```
+
+## 4. 数据库结构 (data/sq_metrics.db)
+
+| 表 | 用途 |
+|---|---|
+| `videos` | 稿件主表(platform / video_key / title / published_at / url / series_tag) |
+| `metrics_snapshots` | 指标快照(snapshot_type: cumulative / deep / T7;播放/点赞/收藏/评论/分享/投币/弹幕/完播率/5s完播/封面点击/2s跳出/平均时长/涨粉/互动率…) |
+| `metric_series` | **通用趋势表**(任意指标逐日/逐小时:播放/点赞/评论/收藏/分享/涨粉…,每日增量) |
+| `audience_snapshots` | 观众画像(性别/年龄/城市/兴趣/来源,JSON 完整保留) |
+| `api_archives` | **接口全量存档**(抓取时拦截的所有 JSON 响应原文,防遗漏可回溯) |
+| `daily_series` | 旧版逐日播放表(兼容保留) |
+
+**抓取策略(全量原则)**:拦截页面所有 JSON 接口 → ①原文全部存 `api_archives`
+②可解析的结构化入库(快照/趋势/画像)。平台改字段也不丢——原文已存档。
+
+## 5. 三平台能力
+
+### B站 (sf_bilibili.py)
+- 核心统计:播放/点赞/收藏/评论/分享/投币/弹幕/涨粉/取关/平均时长
+- 播放端分布:TV/移动/PC 占比(电视污染判定数据)
+- 逐日趋势:8 维度 × 30 天 + 小时级 48h + 近 30 天长尾
+- 完播/跳出(analyze/graph):完播率/同题材均值/留存率曲线(逐 20s,含同类对比)
+- 互动率/3s跳出(play_analyze):互动率、3s 跳出率(万分比÷100)、星级
+- 段退出曲线(viewer_quit):逐 20s 原始计数(不自算留存率,用官方 3s 跳出率)
+- 观众画像:性别/年龄/地区/内容类型/粉丝占比 + 同题材对比 10 条
+- 发布后 30 日:逐日播放 30 天 + 48 小时级 + 长尾(搜索复利)
+
+### 抖音 (sf_douyin.py)
+- 来源:`/janus/douyin/creator/pc/work_list`(作品列表 items[].metrics 全维度)
+- 覆盖:播放/点赞/评论/分享/收藏/弹幕/不喜欢 + 完播率/5s完播/2s跳出率/封面点击率/平均观看秒数/平均播放进度 + 主页访问/吸粉/取关/粉丝观看占比
+- 注意:①rate 为小数(0.151=15.1%)入库 ×100 ②aweme_id 19 位超 JS 精度,必须返回原始文本由 Python 解析 ③登录需扫码+二次验证 ④**冻结机制:详细数据发布 3 个月后停止更新**,旧作品入库自动标注 `metrics_frozen_at`
+
+### 小红书 (sf_xiaohongshu.py)
+- 列表:`api/galaxy/v2/creator/note/user/posted?tab=0&page=N`(滚动翻页,每页约 11 条)
+- 深度(打开 `statistics/note-detail?noteId=X` 拦截):完播率/5s完播/2s跳出/封面点击/平均观看/曝光/涨粉/互动率 + 逐小时 71 点曲线(14 维度)+ 发布后热度指数(200+ 天,含同类对比)+ 观众画像 + 观看来源 + 平台诊断评级(analyse_infos)
+- 注意:①页面请求带 x-s/x-t 签名,直接 fetch 返回 -1,必须拦截页面自身请求 ②**冻结机制:深度数据约 1 年后冻结**,旧笔记 rate 返回 -1 ③URL 参数名是 `noteId`(不是 note_id)④共创笔记 note/base 无权限
+
+## 6. 使用指南
+
+### 环境
+- Python: `/Users/summer/.workbuddy/binaries/python/envs/default/bin/python`
+- Playwright + Chromium 已安装(登录有头,抓取无头)
+
+### 登录(每平台一次,扫码)
+```bash
+cd ~/AQi-fetcher/SF
+python sf_fetch.py login bilibili      # 或 douyin / xiaohongshu
+```
+弹出浏览器扫码,登录后自动保存会话到 `data/fetcher/sessions/{platform}.json`。
+
+### 抓取
+```bash
+# B站(按 BV 或链接)
+python sf_fetch.py fetch bilibili --bv BV1XXXX
+python sf_fetch.py fetch bilibili --url "https://www.bilibili.com/video/BV1XXXX"
+
+# 抖音(按作品ID或链接 / 全量)
+python sf_douyin.py --id <作品ID> --url <链接>
+python sf_douyin.py --all --pages N
+
+# 小红书(列表全量 / 指定 / 深度)
+python sf_xiaohongshu.py --all --pages 40          # 全量列表
+python sf_xiaohongshu.py --id <笔记ID>              # 单篇列表
+python sf_xiaohongshu.py --deep --limit 40          # 深度批量(完播/画像/趋势)
+python sf_xiaohongshu.py --deep --id <笔记ID>       # 单篇深度
+```
+
+### 校验与修复(小红书专项)
+```bash
+python xhs_audit.py          # 全量校验:DB 每条记录 vs 原始存档,输出不一致
+python xhs_reparse.py        # 重解析:从 api_archives 恢复被覆盖/错误的数据
+```
+
+### 查看与导出
+```bash
+python sf_fetch.py status              # 库内稿件清单
+python sf_fetch.py export --xlsx       # 导出 xlsx
+python sf_fetch.py export --json       # 导出 JSON
+```
+
+### 推送快照到主项目(唯一出口)
+```bash
+python sf_push.py            # 导出 JSON+XLSX 并拷入 AQi-channel/data/fetcher/snapshots/
+python sf_push.py --json     # 仅 JSON
+python sf_push.py --to DIR   # 指定目标目录
+```
+
+### 采集成果报告(Word)
+```bash
+python build-sf-report.py --bv BV1XXXX [--out 输出路径]
+```
+
+## 7. 隔离铁律(所有 agent 必须遵守)
+
+1. **AQi-channel 内禁止存在 `sq_metrics.db` 实时库**——只允许导出快照。
+2. **盲测/复盘 agent 禁止读取本工作区**或任何实时采集数据。
+3. 报告/复盘只能引用 `AQi-channel/data/fetcher/snapshots/` 内快照,并声明快照文件名。
+4. 复盘必须用"揭晓时点之前"的快照,禁止用最新数据回填历史判断。
+5. 更新主项目数据:在本项目跑 `sf_push.py`,主项目不直连任何平台接口。
+
+## 8. 命名规范
+
+- 采集器统一命名 **SF (Super Fetcher) v1.0**
+- 模块前缀 `sf_`;历史名称 `sq_fetch_*` 已废弃(2026-08-12 拆分时更名)
+- 小红书专项工具保留 `xhs_` 前缀(xhs_audit / xhs_reparse)
+
+## 9. 迭代规范
+
+对 AQi-fetcher 的任何迭代(新增/修改脚本、调整 DB schema、改字段映射、
+改抓取策略、改导出格式、改冻结判定等),完成后**必须**:
+
+1. 在 `VERSION_HISTORY.md` 顶部追加一条版本记录(格式见该文件模板)。
+2. 更新 `README.md` 中对应能力/用法/注意点(如有变化)。
+3. 修改 DB schema 或字段映射时,同步更新第 4 节表结构说明。
+4. 涉及抓取行为变更,注明对存量数据的影响(是否需要重抓/重解析)。
