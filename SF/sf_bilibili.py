@@ -18,14 +18,21 @@ SQ B站数据抓取器 (sf_bilibili.py)
 用法:
   python sf_bilibili.py --bv BV1XXXX
   python sf_bilibili.py --url https://www.bilibili.com/video/BV1XXXX
+  python sf_bilibili.py --list                      # 列出后台全部稿件(发现新视频)
+  python sf_bilibili.py --list --list-out x.json    # 列表落盘
+  python sf_bilibili.py --sync                      # 自动补抓所有未入库稿件
+  python sf_bilibili.py --sync --since 2026-08-01   # 只补抓该日期之后发布的
+  python sf_bilibili.py --sync --dry-run            # 只列待抓清单,不抓
   python sf_bilibili.py --bv BV1XXXX --show   # 有头调试
 """
 
 import argparse
 import datetime
 import json
+import random
 import re
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -58,6 +65,23 @@ TREND_TYPES = {
     "comment": "comments",
     "dm": "danmaku",
     "share": "shares",
+}
+
+# 稿件列表接口(创作中心稿件管理页 /platform/upload-manager/article 实际调用)
+# status 覆盖全部状态:审核中 / 已通过(pubed) / 未通过
+ARCHIVES_URL = "/x/web/archives"
+ARCHIVE_STATUS = "is_pubing,pubed,not_pubed"
+
+# 稿件状态码 → 文字(state_desc 平台已给,此处留作兜底)
+STATE_DESC = {
+    0: "开放浏览", -1: "待审核", -2: "被打回", -4: "待审核(UP主删除)",
+    -6: "审核中", -7: "审核中", -8: "审核中", -9: "转码失败", -10: "待审核",
+    -11: "待审核", -13: "审核中", -14: "审核中", -15: "审核中",
+    -16: "审核中", -17: "审核中", -18: "审核中", -19: "审核中",
+    -20: "审核中", -21: "审核中", -22: "审核中", -23: "审核中",
+    -24: "审核中", -25: "审核中", -30: "审核中", -40: "审核中", -100: "用户删除",
+    -101: "审核中", -102: "审核中", 100: "开放浏览", 120: "被删除",
+    200: "审核中", 250: "审核中", 300: "审核中", 400: "审核中",
 }
 
 
@@ -299,6 +323,196 @@ def parse_limit(interceptor) -> dict:
     return obj.get("data") or {}
 
 
+# ─── 稿件列表(发现新视频的前提) ──────────────────────────────────────
+def list_archives(headless: bool = True, ps: int = 50, status: str = ARCHIVE_STATUS,
+                  pages: int = 0) -> list:
+    """列出创作中心**全部**稿件(自动分页),按发布时间倒序返回。
+
+    返回每项:
+      {bvid, aid, title, ptime(时间戳), published_at(YYYY-MM-DD), state,
+       state_desc, duration, typename, tag, desc, ctime, stat(若平台返回)}
+
+    pages=0 表示抓到为空为止(全量)。
+    """
+    state_path = SESSION_DIR / "bilibili.json"
+    if not state_path.exists():
+        print("❌ 未找到登录态,请先运行: python sf_login.py bilibili")
+        sys.exit(1)
+
+    items = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx = browser.new_context(
+            storage_state=str(state_path),
+            viewport={"width": 1440, "height": 900},
+            locale="zh-CN",
+        )
+        page = ctx.new_page()
+        page.goto("https://member.bilibili.com/platform/home",
+                  wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(4000)
+
+        if "passport" in page.url:
+            print("⚠️ 登录态已过期,请重新运行: python sf_login.py bilibili")
+            browser.close()
+            sys.exit(1)
+
+        pn = 1
+        total = None
+        while True:
+            try:
+                r = page.evaluate(
+                    """async ({pn, ps, status}) => {
+                        const u = `/x/web/archives?status=${encodeURIComponent(status)}`
+                                + `&pn=${pn}&ps=${ps}&coop=1&interactive=1&t=${Date.now()}`;
+                        const resp = await fetch(u, {credentials: 'include'});
+                        return await resp.json();
+                    }""",
+                    {"pn": pn, "ps": ps, "status": status},
+                )
+            except Exception as e:
+                print(f"  第 {pn} 页取数异常: {str(e)[:80]}")
+                break
+
+            if not r or r.get("code") != 0:
+                print(f"  第 {pn} 页返回非 0: code={r.get('code') if r else 'None'} "
+                      f"msg={r.get('message') if r else ''}")
+                break
+
+            d = r.get("data") or {}
+            page_info = d.get("page") or {}
+            if total is None:
+                total = page_info.get("count")
+                print(f"后台稿件总数: {total}")
+
+            batch = d.get("arc_audits") or []
+            batch += d.get("archives") or []
+            if not batch:
+                break
+
+            for it in batch:
+                a = it.get("Archive") if isinstance(it, dict) else None
+                if a is None:
+                    continue
+                ptime = a.get("ptime") or 0
+                items.append({
+                    "bvid": a.get("bvid"),
+                    "aid": a.get("aid"),
+                    "title": a.get("title"),
+                    "ptime": ptime,
+                    "published_at": _ts_to_date(ptime) if ptime else None,
+                    "ctime": a.get("ctime"),
+                    "state": a.get("state"),
+                    "state_desc": a.get("state_desc") or STATE_DESC.get(a.get("state"), ""),
+                    "duration": a.get("duration"),
+                    "typename": it.get("typename") or a.get("typename"),
+                    "parent_tname": it.get("parent_tname"),
+                    "tag": a.get("tag"),
+                    "desc": a.get("desc"),
+                    "stat": it.get("stat"),
+                })
+
+            if pages and pn >= pages:
+                break
+            if total is not None and len(items) >= total:
+                break
+            if len(batch) < ps:
+                break
+            pn += 1
+            page.wait_for_timeout(800)  # 低频,避免触发风控
+
+        browser.close()
+
+    items.sort(key=lambda x: (x.get("ptime") or 0), reverse=True)
+    return items
+
+
+# ─── 自动补抓:列出全部稿件 → 与 DB 比对 → 抓未入库的 ─────────────────
+def sync_missing(since: str = None, limit: int = 0, headless: bool = True,
+                 dry_run: bool = False, include_nonpublic: bool = False,
+                 only: list = None) -> dict:
+    """把后台「未入库」的稿件全量抓回项目。
+
+    since          只抓发布日 >= since 的稿件(YYYY-MM-DD),缺省不限
+    limit          最多抓几条(0 = 全部)
+    dry_run        只列出待抓清单,不真抓
+    include_nonpublic  是否包含非「开放浏览」稿件(默认只抓公开的)
+    only           指定 bvid 列表,只抓这些(用于定点补抓)
+    """
+    archives = list_archives(headless=headless)
+    db = DB()
+    have = {v["video_key"] for v in db.list_videos(platform="bilibili")}
+
+    todo, skipped_state, already = [], [], 0
+    for a in archives:
+        bv = a.get("bvid")
+        if not bv:
+            continue
+        if bv in have:
+            already += 1
+            continue
+        if only and bv not in only:
+            continue
+        if not include_nonpublic and a.get("state_desc") != "开放浏览":
+            skipped_state.append(a)
+            continue
+        if since and (a.get("published_at") or "") < since:
+            continue
+        todo.append(a)
+
+    todo.sort(key=lambda x: (x.get("ptime") or 0))  # 由旧到新,便于趋势连续
+    if limit:
+        todo = todo[:limit]
+
+    print(f"\n后台上共 {len(archives)} 条稿件 | 已入库 {already} 条 | "
+          f"非公开跳过 {len(skipped_state)} 条 | 本次待抓 {len(todo)} 条")
+    if skipped_state:
+        print("  跳过的非公开稿件:")
+        for a in skipped_state[:10]:
+            print(f"    {a['published_at']}  {a['bvid']}  [{a['state_desc']}]  {a['title'][:34]}")
+        if len(skipped_state) > 10:
+            print(f"    ... 其余 {len(skipped_state) - 10} 条")
+
+    if not todo:
+        print("✅ 没有需要补抓的稿件")
+        return {"total": len(archives), "already": already, "todo": 0,
+                "ok": [], "failed": [], "skipped_state": len(skipped_state)}
+
+    if dry_run:
+        print("\n[dry-run] 待抓清单:")
+        for a in todo:
+            print(f"  {a['published_at']}  {a['bvid']}  {a['title'][:46]}")
+        return {"total": len(archives), "already": already, "todo": len(todo),
+                "ok": [], "failed": [], "skipped_state": len(skipped_state)}
+
+    ok, failed = [], []
+    for i, a in enumerate(todo, 1):
+        print(f"\n{'=' * 68}")
+        print(f"[{i}/{len(todo)}] {a['published_at']}  {a['bvid']}  {a['title'][:40]}")
+        print("=" * 68)
+        try:
+            fetch_video(a["bvid"], headless=headless)
+            ok.append(a["bvid"])
+        except SystemExit as e:
+            print(f"❌ {a['bvid']} 抓取失败(exit={e.code})")
+            failed.append(a["bvid"])
+        except Exception as e:
+            print(f"❌ {a['bvid']} 抓取异常: {str(e)[:100]}")
+            failed.append(a["bvid"])
+        # 低频:每条之间随机延迟,避免触发风控
+        if i < len(todo):
+            delay = random.uniform(8, 15)
+            print(f"   … 等待 {delay:.0f}s 后继续")
+            time.sleep(delay)
+
+    print(f"\n{'=' * 68}")
+    print(f"补抓完成: 成功 {len(ok)} 条 / 失败 {len(failed)} 条")
+    if failed:
+        print("失败列表:", ", ".join(failed))
+    return {"total": len(archives), "already": already, "todo": len(todo),
+            "ok": ok, "failed": failed, "skipped_state": len(skipped_state)}
+
+
 # ─── 主流程 ──────────────────────────────────────────────────────────
 def fetch_video(bv_or_url: str, headless: bool = True):
     state_path = SESSION_DIR / "bilibili.json"
@@ -511,10 +725,43 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="SQ B站数据抓取器(全量)")
     ap.add_argument("--bv", help="BV号")
     ap.add_argument("--url", help="视频链接")
+    ap.add_argument("--list", action="store_true",
+                    help="列出创作中心全部稿件(JSON,按发布时间倒序),不抓取")
+    ap.add_argument("--list-out", help="--list 结果写入该 JSON 文件")
+    ap.add_argument("--sync", action="store_true",
+                    help="自动补抓:列出后台全部稿件→与 DB 比对→抓未入库的")
+    ap.add_argument("--since", help="--sync 时只抓发布日 >= 该日期(YYYY-MM-DD)")
+    ap.add_argument("--limit", type=int, default=0, help="--sync 最多抓几条(0=全部)")
+    ap.add_argument("--bv-only", help="--sync 时只抓指定 BV(逗号分隔),用于定点补抓")
+    ap.add_argument("--include-nonpublic", action="store_true",
+                    help="--sync 时连非「开放浏览」稿件一起抓")
+    ap.add_argument("--dry-run", action="store_true", help="--sync 只列清单不抓")
     ap.add_argument("--show", action="store_true", help="有头模式(调试)")
     args = ap.parse_args()
+
+    if args.sync:
+        only = [s.strip() for s in args.bv_only.split(",")] if args.bv_only else None
+        res = sync_missing(since=args.since, limit=args.limit, headless=not args.show,
+                           dry_run=args.dry_run, include_nonpublic=args.include_nonpublic,
+                           only=only)
+        sys.exit(1 if res["failed"] else 0)
+
+    if args.list:
+        result = list_archives(headless=not args.show)
+        print(f"\n共列出 {len(result)} 条稿件")
+        if args.list_out:
+            out = Path(args.list_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"已写入: {out}")
+        else:
+            for it in result:
+                print(f"  {it['published_at']}  {it['bvid']}  [{it['state_desc']}]  {it['title']}")
+        sys.exit(0)
+
     target = args.url or args.bv
     if not target:
         print("用法: python sf_bilibili.py --bv BV1XXXX 或 --url <链接>")
+        print("      python sf_bilibili.py --list [--list-out FILE]   # 列出全部稿件")
         sys.exit(1)
     fetch_video(target, headless=not args.show)

@@ -17,10 +17,15 @@ import argparse
 import datetime
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "sq_metrics.db"
+
+# v1.2.0:原始响应从 api_archives.body_json 迁移至 data/assets/ 文件,经 asset_path 读取
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sf_core import load_asset  # noqa: E402
 
 HOUR_MAP = {
     "view_list": "hour_views", "like_list": "hour_likes",
@@ -48,15 +53,12 @@ def ts_date(ts):
 
 def get_archive(conn, vkey, frag):
     rows = conn.execute(
-        """SELECT url, body_json FROM api_archives
+        """SELECT url, asset_path FROM api_archives
            WHERE platform='xiaohongshu' AND video_key=? AND url LIKE ?
            ORDER BY captured_at DESC LIMIT 1""", (vkey, f"%{frag}%")).fetchall()
     if not rows:
         return None
-    try:
-        return json.loads(rows[0]["body_json"])
-    except Exception:
-        return None
+    return load_asset(rows[0]["asset_path"])
 
 
 def main():
@@ -84,12 +86,11 @@ def main():
         # ── 1. posted 存档(基础数据) ──
         posted = None
         rows = conn.execute(
-            """SELECT body_json FROM api_archives
+            """SELECT asset_path FROM api_archives
                WHERE platform='xiaohongshu' AND url LIKE '%note/user/posted%'""").fetchall()
         for r in rows:
-            try:
-                d = json.loads(r["body_json"])
-            except Exception:
+            d = load_asset(r["asset_path"])
+            if d is None:
                 continue
             for n in (d.get("data") or {}).get("notes") or []:
                 if str(n.get("id")) == vkey:

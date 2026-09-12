@@ -15,6 +15,7 @@ SQ 数据采集核心库 (sf_core)
 创建: 2026-08-11
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -29,6 +30,8 @@ EXPORT_DIR = ROOT / "data" / "fetcher"
 SESSION_DIR = ROOT / "data" / "fetcher" / "sessions"
 # 导出快照目录(带时间戳,供拷入 AQi-channel 使用)
 SNAPSHOT_DIR = ROOT / "export"
+# 独立资产目录:原始接口响应全文按 {YYYY_MM}_{platform}/ 归档(v1.2.0 起)
+ASSET_DIR = ROOT / "data" / "assets"
 
 # ─── 平台字段映射 ───────────────────────────────────────────────────
 # 各平台后台导出/抓取到的原始字段 → 统一标准字段
@@ -139,13 +142,15 @@ class DB:
                     FOREIGN KEY(video_id) REFERENCES videos(id)
                 );
                 -- 接口存档表:所有拦截到的 JSON 接口响应(全量原始数据,防遗漏)
+                -- v1.2.0:响应全文剥离为独立资产文件(data/assets/),本表只存元数据+资产路径指针
                 CREATE TABLE IF NOT EXISTS api_archives (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
                     video_key TEXT,
                     url TEXT NOT NULL,
                     captured_at TEXT DEFAULT (datetime('now','localtime')),
-                    body_json TEXT,                   -- 响应全文 JSON
+                    body_json TEXT,                   -- 响应全文 JSON(存量已迁移后置空)
+                    asset_path TEXT,                  -- 资产文件相对路径(data/assets/ 下)
                     UNIQUE(url, captured_at)
                 );
                 CREATE INDEX IF NOT EXISTS idx_snap_video ON metrics_snapshots(video_id);
@@ -155,6 +160,12 @@ class DB:
                 CREATE INDEX IF NOT EXISTS idx_api_video ON api_archives(video_key);
                 """
             )
+            # v1.2.0:旧库 api_archives 无 asset_path 列时补充(ALTER 不破坏存量)
+            cols = [r["name"] for r in c.execute("PRAGMA table_info(api_archives)")]
+            if "asset_path" not in cols:
+                c.execute("ALTER TABLE api_archives ADD COLUMN asset_path TEXT")
+            # 资产目录就绪
+        os.makedirs(ASSET_DIR, exist_ok=True)
 
     # ── videos ──
     def upsert_video(self, platform, video_key, title=None, published_at=None,
@@ -307,11 +318,19 @@ class DB:
 
     # ── api_archives(接口全量存档) ──
     def add_api_archive(self, platform, video_key, url, body_json):
+        """接口响应落盘为独立资产文件(data/assets/),本表只存元数据+路径指针。
+
+        v1.2.0 起 body_json 不再入库:响应全文按抓取月份归档为
+        assets/{YYYY_MM}_{platform}/raw_{stamp}_{video_key}.json。
+        """
+        captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rel = write_asset(platform, video_key, url, body_json, captured_at)
         with self._conn() as c:
             c.execute(
-                "INSERT INTO api_archives (platform, video_key, url, body_json) VALUES (?,?,?,?)",
-                (platform, video_key, url, body_json),
+                "INSERT INTO api_archives (platform, video_key, url, captured_at, asset_path) VALUES (?,?,?,?,?)",
+                (platform, video_key, url, captured_at, rel),
             )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def list_api_archives(self, video_key=None, limit=100):
         with self._conn() as c:
@@ -397,6 +416,50 @@ def t7_date(published_at: str) -> str:
     return (pub_date + timedelta(days=7)).strftime("%Y-%m-%d")
 
 
+# ─── 独立资产(原始接口响应全文,按 年_月_平台 归档) ────────────────
+def asset_rel_path(platform: str, captured_at: str, video_key: str) -> str:
+    """资产相对路径: {YYYY_MM}_{platform}/raw_{YYYYMMDD_HHMMSS}_{video_key}.json
+
+    资产按「抓取月份」归档(当时快照),与交付数据按「发布月份」区分开。
+    """
+    ym = captured_at[:7].replace("-", "_")          # 2026-09 → 2026_09
+    stamp = captured_at[:19].replace("-", "").replace(":", "").replace(" ", "_")  # 20260905_103000
+    return f"{ym}_{platform}/raw_{stamp}_{video_key}.json"
+
+
+def write_asset(platform: str, video_key: str, url: str, body_json: str,
+                captured_at: str = None) -> str:
+    """把接口响应全文写入 assets/ 目录,返回相对路径。
+
+    同一视频同一秒可能拦截多个接口(不同 URL),文件名冲突时追加
+    URL 短 hash 后缀区分,保证不互相覆盖。
+    """
+    captured_at = captured_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rel = asset_rel_path(platform, captured_at, video_key)
+    p = ASSET_DIR / rel
+    if p.exists():
+        h = hashlib.md5(url.encode("utf-8")).hexdigest()[:6]
+        ym = captured_at[:7].replace("-", "_")
+        stamp = captured_at[:19].replace("-", "").replace(":", "").replace(" ", "_")
+        rel = f"{ym}_{platform}/raw_{stamp}_{video_key}_{h}.json"
+        p = ASSET_DIR / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body_json if isinstance(body_json, str) else json.dumps(body_json, ensure_ascii=False),
+                 encoding="utf-8")
+    return rel
+
+
+def load_asset(rel_path: str):
+    """从资产文件读原始响应,返回 JSON 对象;缺失/损坏返回 None。"""
+    if not rel_path:
+        return None
+    p = ASSET_DIR / rel_path
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def export_xlsx(db: DB, out_path=None):
     """把数据库全量导出为 xlsx(三平台各一张 sheet)。
 
@@ -449,6 +512,117 @@ def export_json(db: DB, out_path=None):
         out_path = SNAPSHOT_DIR / f"sq_metrics_{stamp}.json"
     out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
+
+
+def export_monthly(db: DB, year_month: str, platform: str, split_video: bool = False,
+                   since: str = None, out_dir=None):
+    """按月×平台导出交付物(v1.2.0 推荐出口,替代全量单文件推送)。
+
+    规则:
+    - 视频归属月 = published_at 前 7 位(year_month,如 "2026-09")
+    - 快照去重:每视频只输出「最新一条 cumulative/T7」+「全部 deep」,剔除 raw_json
+    - since:增量语义,仅过滤快照 captured_at >= since;趋势/画像始终给完整档案
+    - 产出目录 {out_dir}/{YYYY_MM}_{platform}/:
+        manifest.json / videos.json / snapshots.json / trends.json / audience.json
+      split_video=True 时另生成 videos/{video_key}.json 单视频文件(agent 按需直读)
+    """
+    ym = year_month
+    ym_dir = ym.replace("-", "_")  # 目录名用下划线: 2026-07 → 2026_07(与资产目录一致)
+    if out_dir is None:
+        out_dir = SNAPSHOT_DIR / f"{ym_dir}_{platform}"
+    else:
+        out_dir = Path(out_dir) / f"{ym_dir}_{platform}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with db._conn() as c:
+        vrows = c.execute(
+            "SELECT * FROM videos WHERE platform=? AND substr(published_at,1,7)=? ORDER BY published_at DESC",
+            (platform, ym)).fetchall()
+    videos = [dict(v) for v in vrows]
+
+    snap_rows, trend_rows, aud_rows = [], [], []
+    data_through = None
+    per_video = {}  # video_key -> {"video":..,"snapshots":..,"trends":..,"audience":..}
+
+    for v in vrows:
+        vid = v["id"]
+        with db._conn() as c:
+            cum = c.execute(
+                """SELECT * FROM metrics_snapshots
+                   WHERE video_id=? AND snapshot_type IN ('cumulative','T7')
+                   ORDER BY captured_at DESC LIMIT 1""", (vid,)).fetchone()
+            deeps = c.execute(
+                """SELECT * FROM metrics_snapshots
+                   WHERE video_id=? AND snapshot_type='deep' ORDER BY captured_at""",
+                (vid,)).fetchall()
+            trends = c.execute(
+                "SELECT * FROM metric_series WHERE video_id=? ORDER BY metric, stat_date",
+                (vid,)).fetchall()
+            auds = c.execute(
+                "SELECT * FROM audience_snapshots WHERE video_id=? ORDER BY captured_at",
+                (vid,)).fetchall()
+
+        snaps = ([dict(cum)] if cum else []) + [dict(s) for s in deeps]
+        for s in snaps:
+            s.pop("raw_json", None)  # 原始全文留在 assets/,不进交付物
+            if since and s.get("captured_at", "") < since:
+                continue
+            if s.get("captured_at") and (data_through is None or s["captured_at"] > data_through):
+                data_through = s["captured_at"]
+            snap_rows.append(s)
+        t_rows = [dict(t) for t in trends]
+        a_rows = [dict(a) for a in auds]
+        for a in a_rows:  # JSON 字段解析为对象,交付友好
+            for k in ("gender_json", "age_json", "region_json", "source_json", "interest_json", "extra_json"):
+                if a.get(k):
+                    try:
+                        a[k] = json.loads(a[k])
+                    except (ValueError, TypeError):
+                        pass
+        trend_rows += t_rows
+        aud_rows += a_rows
+        per_video[v["video_key"]] = {
+            "video": dict(v),
+            "snapshots": [s for s in snaps if not (since and s.get("captured_at", "") < since)],
+            "trends": t_rows,
+            "audience": a_rows,
+        }
+
+    manifest = {
+        "schema": "sf-monthly-v1",
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "month": ym,
+        "platform": platform,
+        "since": since,
+        "video_count": len(videos),
+        "files": {
+            "videos.json": len(videos),
+            "snapshots.json": len(snap_rows),
+            "trends.json": len(trend_rows),
+            "audience.json": len(aud_rows),
+        },
+        "data_through": data_through,
+        "videos": [v["video_key"] for v in videos],
+    }
+
+    def dump(obj, name):
+        (out_dir / name).write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+
+    dump(videos, "videos.json")
+    dump(snap_rows, "snapshots.json")
+    dump(trend_rows, "trends.json")
+    dump(aud_rows, "audience.json")
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if split_video:
+        vdir = out_dir / "videos"
+        vdir.mkdir(exist_ok=True)
+        for key, pv in per_video.items():
+            (vdir / f"{key}.json").write_text(
+                json.dumps(pv, ensure_ascii=False), encoding="utf-8")
+
+    return out_dir
 
 
 if __name__ == "__main__":

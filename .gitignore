@@ -8,6 +8,10 @@ data/fetcher/sessions/
 data/sq_metrics.db
 data/*.db
 data/*.db-journal
+# 原始响应资产(v1.2.0 起 data/assets/,含平台返回 token 字段,体量大,绝不入库)
+data/assets/
+# DB 版本备份(迭代前生成,含真实后台数据)
+data/backup/
 
 # ── 快照:导出数据(仅本地/主项目使用,不公开) ──
 export/

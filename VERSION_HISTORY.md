@@ -6,6 +6,183 @@
 
 ---
 
+## v1.3.0 (2026-09-12)
+
+### 变更内容
+- [功能] **B站稿件自动发现与补抓**(解决"抓取器只能按 BV 单抓、无法发现新视频"的能力缺口):
+  - `sf_bilibili.py --list`:调用创作中心稿件列表接口 `/x/web/archives`(自动分页),
+    列出后台**全部**稿件,按发布时间倒序;`--list-out` 可落盘 JSON。
+    实测后台 284 条稿件与接口 `page.count` 完全一致。
+  - `sf_bilibili.py --sync`:一条命令完成「列出全部稿件 → 与 DB 比对 → 抓未入库的」。
+    支持 `--since YYYY-MM-DD`(只抓该日之后发布)、`--limit N`、`--bv-only`(定点补抓)、
+    `--include-nonpublic`、`--dry-run`(只列清单)。默认跳过非「开放浏览」稿件。
+    每条之间随机延迟 8–15s,避免触发风控。
+- [新增] **`bili_audit.py` B站数据全量校验器**(对标 `xhs_audit.py`,全量核对不抽查):
+  逐条把 DB 与抓取时存档的接口原文(`data/assets/`)比对,覆盖 7 类共 54 项:
+  ① 稿件身份(title/published_at) ② 核心指标 9 项 ③ 完播率/平均时长/段退出曲线
+  ④ 互动率/3s跳出率/播放来源 10 项 ⑤ TV 占比重算 ⑥ 趋势日期集合(8 维度逐日 +
+  小时级 + 近30天长尾,逐日期比对) ⑦ 画像字段完整性。支持 `--bv`、`--csv` 明细导出。
+- [修复] **B站趋势指标命名不统一(存量数据问题)**:v1.0 时期抓取的 `BV1rnaJzpEFv`
+  把逐日播放/转粉趋势写成 `daily_plays` / `daily_followers`,而现行代码统一用
+  `plays` / `followers`,导致该稿件的数据挂在旧名下:
+  - 同一份交付物里出现两套命名(其余 5 条稿件均为新命名);
+  - 任何按 `plays` 查询的消费方(主项目/报告/审计)读不到这条稿件的数据。
+  新增 `sf_migrate_metric_names.py` 就地改名(不删除,保住当初抓到的
+  2025-09-01~2025-09-30 那段日期区间——趋势接口只给固定窗口,无法事后补抓历史)。
+  改名 60 行,冲突 0 行。
+- [校准] `bili_audit.py` 的 `avg_duration` 核对判据修正:B站 `archive_diagnose/overview`
+  的 `stat.play_avg_duration` 字段**实测恒为 0**(全部 6 条稿件验证),真实平均播放时长
+  只在 `v2/archive/analyze/graph` 的 `duration_info.avg_play_time_int`。故该字段的核对
+  移到 graph 一节,避免误报。
+- [数据] **补抓停滞期 B站新稿件 5 条**(2026-08-08 ~ 2026-08-27),每条 29 个接口存档、
+  8 维度趋势全绿、完播与播放分析接口均 ok,失败 0 条。
+
+### 涉及文件
+- `SF/sf_bilibili.py`(新增 `list_archives()` / `sync_missing()` / `--list` / `--sync` 等)
+- `SF/bili_audit.py`(新增,全量校验器)
+- `SF/sf_migrate_metric_names.py`(新增,一次性指标改名)
+
+### 存量数据影响
+- [需重解析/已迁移] `BV1rnaJzpEFv` 的 `daily_plays`/`daily_followers` 共 60 行就地改名为
+  `plays`/`followers`;改名前后行数一致、无冲突、无数据丢失。
+- [仅记录,未处理] `retention_20s`(17 行,仅 `BV1rnaJzpEFv` 有,现行代码已不再产出)
+  予以保留:它是当时由 graph 数据派生的留存率,删除会丢信息;消费方应优先看
+  `quit_curve_20s`(现行标准口径)。
+- [新增数据] B站稿件 1 → 6 条;`metrics_snapshots` +5;`metric_series` B站部分 +3648;
+  `audience_snapshots` +5;`api_archives` +145。
+- 备份:`data/backup/sq_metrics_v1.2.2_20260912_pre_bili_sync.db`(迁移前,4.8MB)、
+  `data/backup/sq_metrics_pre_migrate_metric_names.db`(指标改名:前)。
+
+### 验证结果
+- `py_compile` 全部通过。
+- **`bili_audit.py` 全量核对 6 条稿件 / 324 项 → 0 不一致**(明细 CSV:
+  `/tmp/bili_audit_20260912.csv`)。
+- 首次核对曾报 3 处不一致,逐一定性:
+  - `avg_duration`(旧稿 DB=155 / overview 原文=0)→ 判据错,DB 正确(graph 取值),已校准脚本;
+  - `plays` / `followers` 缺 30 个日期 → 确认为真问题(旧命名),已通过改名修复。
+- `--list` 实测返回 284 条 = 接口 `page.count`,一致。
+- `--sync --since 2026-08-01` 实测:先 dry-run 确认清单为 5 条,再正式抓取,成功 5 / 失败 0。
+- 交付验证:`sf_push.py --month 2026-08 --platform bilibili` →
+  `AQi-channel/data/fetcher/snapshots/2026_08_bilibili/`
+  (manifest: 视频 5 · 快照 5 · 趋势 3648 · 画像 5 · 截止 2026-09-12 11:09:48;
+  `snapshots.json` 含 `raw_json` 的行数 = 0;videos/snapshots/trends/audience 的
+  `video_id` 关联全部可映射)。
+
+---
+
+## v1.2.2 (2026-09-12)
+
+### 变更内容
+- [修复] **`sf_login.py` 会话保存路径错误(严重)**:该文件自行推算
+  `ROOT = Path(__file__).resolve().parents[2]` → 得到 `/Users/summer`,
+  于是 `SESSION_DIR` 指向 `/Users/summer/data/fetcher/sessions`(非项目目录),
+  而所有抓取器(`sf_bilibili.py` / `sf_douyin.py` / `sf_xiaohongshu.py`)读取的是
+  `sf_core.SESSION_DIR` = `~/AQi-fetcher/data/fetcher/sessions`。
+  **后果**:重新登录后会话被存到错误位置,**抓取器仍继续使用旧(可能已过期)会话**,
+  表现为"明明刚扫过码却仍提示登录态过期",且会污染项目外目录。
+  修复方式:改为 `from sf_core import SESSION_DIR`,路径统一由核心库提供,
+  禁止各脚本自行推算 ROOT。
+- [新增] **`sf_check_session.py` 会话探活检查器**:三级判定(① cookie 有效期 →
+  ② 带登录态真实打开创作后台看是否被重定向到登录页 → ③ 调需登录接口验证),
+  因为 cookie 未过期 ≠ 服务端仍认。支持 `python sf_check_session.py`(全平台)/
+  `<platform>`(单平台)/ `--no-live`(只看 cookie 时间)/ `--show`(有头)。
+- [清理] `sf_login.py` 中与现登录判据矛盾的过期注释:原注释写"小红书必须出现
+  web_session cookie 作为登录硬标志",而 `LOGIN_RULES` 实际使用的是 creator 专用
+  cookie(`access-token-creator.xiaohongshu.com` 等),web_session 在 creator 平台
+  根本不下发 → 已更正,避免后续 agent 被误导改错判据。
+- [记录] 遗留待处理(本轮未改,涉及产出路径语义需用户确认):
+  - `SF/build-sf-report.py` 默认 `--out` 指向 `/Users/summer/UP/`(不存在),
+    不带 `--out` 运行会失败,应为 `~/AQi-channel/UP/`。
+  - `SF/report_lib_v4.py` 的 `OUT` / `SCRIPT_PATH` 为未被引用的死常量,
+    且指向不存在的 `/Users/summer/UP/`、`/Users/summer/scripts/`,建议删除或修正。
+
+### 涉及文件
+- `SF/sf_login.py`(路径修复 + 注释清理)
+- `SF/sf_check_session.py`(新增)
+
+### 存量数据影响
+- [无影响] 未改动 DB schema / 字段映射 / 抓取解析逻辑,存量数据与快照均不受影响。
+- [安全核查] `/Users/summer/data/` 目录**不存在**,说明该 bug 从未实际写入过错误位置,
+  项目内 3 个会话文件均完好,无需迁移。
+
+### 验证结果
+- `py_compile sf_login.py sf_check_session.py` 通过。
+- 路径一致性验证:`sf_login.SESSION_DIR == sf_core.SESSION_DIR` → `True`,
+  且该目录存在;全项目 `parents[2]` 残留已排查(仅剩报告脚本死常量,见上)。
+- **三平台会话实测(2026-09-12,真实打开创作后台)**:
+
+  | 平台 | cookie 有效期 | 真实后台访问 | 结论 |
+  |---|---|---|---|
+  | bilibili | SESSDATA 至 2027-02-07(剩 148 天) | 正常进入 `member.bilibili.com/platform/home`,`nav` 接口 `isLogin=True`(账号 阿七AQi_) | ✅ 有效 |
+  | douyin | sessionid 至 2026-10-10(剩 28 天) | 正常进入 `creator.douyin.com/creator-micro/content/manage`,作品 284 条 | ✅ 有效 |
+  | xiaohongshu | `access-token-creator` + `galaxy_creator_session_id` 已于 2026-09-10 过期 | 被重定向至 `/login?redirectReason=401` | ❌ 需重新登录 |
+
+---
+
+## v1.2.1 (2026-09-12)
+
+### 变更内容
+- [修复] `.gitignore` 缺口补全:v1.2.0 新增的 `data/assets/`(原始响应全文,含平台返回
+  token 等字段,约 20MB)与 `data/backup/`(DB 版本备份,含真实后台数据)未被忽略,
+  存在误 `git add` 入库的泄露风险 → 已加入忽略规则。
+- [适配] `AGENTS.md` 同步至 v1.2 口径(修正 v1.2.0 迭代时的文档遗漏):
+  - 版本号 `SF v1.0` → `SF v1.2`
+  - 隔离铁律第 5 条 + 常见操作备忘的 `sf_push.py` 命令补齐
+    `--month YYYY-MM [--platform X] / --all`(旧的无参数调用已失效)
+  - 数据安全章节补充 `data/assets/`、`data/backup/` 的管理要求
+
+### 涉及文件
+- `.gitignore`、`AGENTS.md`
+
+### 存量数据影响
+- 无影响(仅忽略规则与文档,不涉及数据、schema 或抓取行为)。
+
+### 验证结果
+- `git check-ignore -v` 确认 `data/assets/`、`data/backup/`、`data/sq_metrics.db` 均被忽略
+- `git status` 复核:`data/` 已不再出现在未跟踪列表(仅剩代码/文档改动 + `.workbuddy/`、`SF/sf_migrate_assets.py`)
+
+---
+
+## v1.2.0 (2026-08-13)
+
+### 变更内容
+- [重构] **原始响应剥离为独立资产**:`api_archives.body_json` 全文不再入库,改为落盘
+  `data/assets/{YYYY_MM}_{platform}/raw_{stamp}_{video_key}[_hash].json`(按**抓取月份**归档),
+  本表只存元数据 + `asset_path` 指针。同一视频同秒多接口时文件名追加 URL 短 hash 防覆盖。
+- [功能] **按月×平台分目录交付**:新增 `export_monthly()`,产出
+  `export/{YYYY_MM}_{platform}/`(按**发布月份**),含 `manifest.json` 清单 +
+  `videos/snapshots/trends/audience` 四个数据文件。
+  - 快照去重:每视频只输出「最新一条 cumulative/T7」+「全部 deep」,剔除 raw_json
+  - `--split-video` 时另生成 `videos/{video_key}.json` 单视频文件(agent 按需直读)
+  - `since` 增量语义:仅过滤快照 captured_at ≥ since,趋势/画像给完整档案
+- [功能] `sf_push.py` 重构:`--month YYYY-MM / --platform / --split-video / --since / --all / --to`;
+  交付物按 `{YYYY_MM}_{platform}/` 拷入主项目,不再生成全量单文件(全量归档走 `sf_fetch.py export`)。
+- [适配] `xhs_audit.py` / `xhs_reparse.py` 改为经 `asset_path` 读资产文件(`load_asset`),
+  不再依赖 `body_json` 列。
+- [新增] `sf_migrate_assets.py`:一次性存量迁移(落盘→回填指针→校验→清空 body_json)。
+
+### 涉及文件
+- `SF/sf_core.py`(schema 加 asset_path / write_asset / load_asset / export_monthly / add_api_archive 改造)
+- `SF/sf_push.py`(重写为按月×平台推送)
+- `SF/xhs_audit.py`、`SF/xhs_reparse.py`(读资产文件)
+- `SF/sf_migrate_assets.py`(新增,一次性迁移)
+- `README.md`、`SF/README.md`(同步更新)
+
+### 存量数据影响
+- 需迁移(已完成):api_archives 890 条 body_json → 890 个资产文件,指针回填,body_json 置空。
+  DB 22.7MB → 4.06MB(VACUUM 后,约 -82%)。
+- 备份:`data/backup/sq_metrics_v1.1.0_20260813.db`(可回退)。
+
+### 验证结果
+- 迁移校验:890/890 落盘成功,抽查 20/20 内容一致
+- `xhs_audit.py` 全量 211 篇跑通(资产链路 OK;2 处差异为 v1.1.0 实测新抓数据 vs 旧列表页存档的正常新旧差)
+- `xhs_reparse.py --video` 单篇跑通(修复逐小时 852 / 热度指数 215)
+- 按月导出三平台结构验证通过;`--split-video`(单视频文件含 video/snapshots/trends/audience、
+  无 raw_json)、`--since` 增量过滤(4 条)验证通过
+- 冒烟测试:核心库导入 OK,三平台数据完整
+
+---
+
 ## v1.1.0 (2026-08-12)
 
 ### 变更内容

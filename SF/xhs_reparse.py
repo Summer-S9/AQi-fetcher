@@ -22,6 +22,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "sq_metrics.db"
 
+# v1.2.0:原始响应从 api_archives.body_json 迁移至 data/assets/ 文件,经 asset_path 读取
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sf_core import load_asset  # noqa: E402
+
 # hour 列表 → metric 名(与抓取器一致)
 HOUR_MAP = {
     "view_list": "hour_views", "like_list": "hour_likes",
@@ -66,11 +70,11 @@ def main():
         vid, vkey, pub = v["id"], v["video_key"], v["published_at"]
         # 1) 找该笔记最新的 note/base 存档(含 hour 曲线)
         rows = conn.execute(
-            """SELECT body_json FROM api_archives
+            """SELECT asset_path FROM api_archives
                WHERE platform='xiaohongshu' AND video_key=? AND url LIKE '%datacenter/note/base%'
                ORDER BY captured_at DESC LIMIT 1""", (vkey,)).fetchall()
-        if rows:
-            d = json.loads(rows[0]["body_json"])
+        d = load_asset(rows[0]["asset_path"]) if rows else None
+        if d:
             hour = (d.get("data") or {}).get("hour") or {}
             # 删除旧的 hour_* 数据后重写
             conn.execute("DELETE FROM metric_series WHERE video_id=? AND metric LIKE 'hour\\_%' ESCAPE '\\'", (vid,))
@@ -88,11 +92,11 @@ def main():
 
         # 2) 找该笔记最新的 audience/trend 存档
         rows = conn.execute(
-            """SELECT body_json FROM api_archives
+            """SELECT asset_path FROM api_archives
                WHERE platform='xiaohongshu' AND video_key=? AND url LIKE '%audience/trend%'
                ORDER BY captured_at DESC LIMIT 1""", (vkey,)).fetchall()
-        if rows:
-            d = json.loads(rows[0]["body_json"])
+        d = load_asset(rows[0]["asset_path"]) if rows else None
+        if d:
             data = d.get("data") or {}
             tl = data.get("trend_list") or []
             st = data.get("similar_trend_list") or []

@@ -10,12 +10,14 @@ SQ 平台登录器 (sf_login.py)
 """
 
 import sys
-from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-ROOT = Path(__file__).resolve().parents[2]
-SESSION_DIR = ROOT / "data" / "fetcher" / "sessions"
+# 路径统一从核心库取——禁止在本文件自行推算 ROOT。
+# (历史 bug:此处曾用 parents[2] 得到 ~/data/fetcher/sessions,与抓取器读取的
+#  ~/AQi-fetcher/data/fetcher/sessions 不一致,导致重新登录后会话存错位置、
+#  抓取器仍用旧会话。2026-09-12 修复,见 VERSION_HISTORY v1.2.2)
+from sf_core import SESSION_DIR
 
 # 各平台创作中心登录地址
 PLATFORM_LOGIN_URL = {
@@ -90,7 +92,9 @@ def login(platform: str, headless: bool = False, timeout_ms: int = 300_000):
 
         # 小红书注意:未登录时 publish 页会先渲染(带"发布笔记"等文字),1~2秒后才
         # 重定向到 /login。因此页面文字判据不可用,必须:
-        #   1) 出现 web_session cookie(登录硬标志)
+        #   1) 出现 creator 专用登录 cookie(硬标志,见 LOGIN_RULES["xiaohongshu"]
+        #      —— 是 access-token-creator.xiaohongshu.com / x-user-id-creator...
+        #      **不是** www 版的 web_session,creator 平台根本不下发它)
         #   2) URL 离开 /login
         #   3) 事后实测(重新打开创作中心确认不跳登录页)
         for _ in range(timeout_ms // 3000):
