@@ -1,4 +1,4 @@
-# SF (Super Fetcher) v1.2 — 采集器代码
+# SF (Super Fetcher) v1.4 — 采集器代码
 
 AQi-channel 的独立数据采集项目。**独立工作区**,与 AQi-channel 盲测项目物理隔离,
 通过按月×平台分目录的交付快照单向供给数据,避免盲测/复盘 agent 污染。
@@ -8,7 +8,7 @@ AQi-channel 的独立数据采集项目。**独立工作区**,与 AQi-channel �
 
 ```
 ~/AQi-fetcher/
-├── SF/                    # SF v1.2 采集器代码(本目录)
+├── SF/                    # SF v1.4 采集器代码(本目录)
 │   ├── sf_core.py         # 核心库:DB/标准化/快照/T7/资产读写(write_asset/load_asset)/按月导出
 │   ├── sf_fetch.py        # CLI 入口(login/fetch/status/export 本地归档)
 │   ├── sf_login.py        # 三平台登录(浏览器扫码,保存会话)
@@ -17,9 +17,11 @@ AQi-channel 的独立数据采集项目。**独立工作区**,与 AQi-channel �
 │   ├── sf_douyin.py       # 抖音抓取器
 │   ├── sf_xiaohongshu.py  # 小红书抓取器(列表+深度)
 │   ├── bili_audit.py      # B站全量校验(DB vs 接口原文,54 项/条)
+│   ├── bili_import_audit.py # B站历史导入数据全量核对(反向链路,2305 项)
 │   ├── xhs_audit.py       # 小红书全量校验(DB vs 资产文件)
 │   ├── xhs_reparse.py     # 小红书重解析(从资产文件恢复)
 │   ├── sf_push.py         # 按月×平台导出并推送主项目(唯一出口)
+│   ├── sf_import_bili_history.py # B站历史基线合并导入(xlsx → DB,幂等)
 │   ├── sf_migrate_assets.py # 一次性存量迁移(资产落盘,仅 v1.2.0 用过)
 │   ├── sf_migrate_metric_names.py # 一次性指标命名归一(仅 v1.3.0 用过)
 │   ├── build-sf-report.py # 采集成果 Word 报告生成器
@@ -27,6 +29,7 @@ AQi-channel 的独立数据采集项目。**独立工作区**,与 AQi-channel �
 ├── data/
 │   ├── sq_metrics.db      # 主数据库(真实后台数据,已剥离原始全文,约 4MB)
 │   ├── assets/            # 独立资产:原始接口响应全文,按 {YYYY_MM}_{platform}/ 归档
+│   ├── imports/           # 历史导入数据源留档(xlsx 副本 + 配对报告)
 │   ├── backup/            # DB 版本备份
 │   └── fetcher/sessions/  # 三平台登录会话
 ├── export/                # 交付物:{YYYY_MM}_{platform}/ 分目录
@@ -37,7 +40,7 @@ AQi-channel 的独立数据采集项目。**独立工作区**,与 AQi-channel �
 
 ## 命名规范
 
-- 采集器统一命名 **SF (Super Fetcher) v1.2**
+- 采集器统一命名 **SF (Super Fetcher) v1.4**
 - 模块前缀 `sf_`,历史名称 sq_fetch_* 已废弃
 - 审计脚本保留 xhs_ 前缀(专项工具)
 
@@ -74,8 +77,14 @@ python sf_xiaohongshu.py --deep --limit 40
 
 # 校验/重解析(读 data/assets/ 资产文件)
 python bili_audit.py     # B站全量校验(全量不抽查)
+python bili_import_audit.py  # B站历史导入数据全量核对(2305 项)
 python xhs_audit.py
 python xhs_reparse.py
+
+# 历史数据合并导入(B站,幂等;导入后必跑核对)
+python sf_import_bili_history.py --dry-run   # 只配对出报告,不写库
+python sf_import_bili_history.py             # 正式导入
+python bili_import_audit.py                  # 全量核对
 
 # 按月×平台交付推送主项目(唯一出口)
 python sf_push.py --month 2026-09 --platform bilibili

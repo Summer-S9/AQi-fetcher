@@ -1,4 +1,4 @@
-# AQi-fetcher — SF (Super Fetcher) v1.2 数据采集项目
+# AQi-fetcher — SF (Super Fetcher) v1.4 数据采集项目
 
 AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书创作后台自动抓取
 真实数据,统一入库,并通过**按月×平台分目录的快照**单向供给 AQi-channel 盲测项目使用。
@@ -13,7 +13,7 @@ AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书�
 
 | 项 | 说明 |
 |---|---|
-| 全称 | SF (Super Fetcher) v1.2 |
+| 全称 | SF (Super Fetcher) v1.4 |
 | 工作区 | `~/AQi-fetcher/` |
 | 服务对象 | AQi-channel(盲测/复盘/报告) |
 | 数据源 | B站创作中心 / 抖音创作者中心 / 小红书创作服务平台 |
@@ -24,7 +24,7 @@ AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书�
 
 ```
 ~/AQi-fetcher/
-├── SF/                         # SF v1.2 采集器代码
+├── SF/                         # SF v1.4 采集器代码
 │   ├── sf_core.py              # 核心库:DB 连接/字段标准化/T+7 判定/资产读写/按月导出
 │   ├── sf_fetch.py             # CLI 入口(login/fetch/status/export 本地归档)
 │   ├── sf_login.py             # 三平台登录(浏览器扫码,保存会话)
@@ -33,9 +33,11 @@ AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书�
 │   ├── sf_douyin.py            # 抖音抓取器
 │   ├── sf_xiaohongshu.py       # 小红书抓取器(列表+深度)
 │   ├── bili_audit.py           # B站全量校验(DB vs 接口原文,54 项/条)
+│   ├── bili_import_audit.py    # B站历史导入数据全量核对(反向链路,2305 项)
 │   ├── xhs_audit.py            # 小红书全量校验(DB vs 资产文件)
 │   ├── xhs_reparse.py          # 小红书重解析(从资产文件恢复)
 │   ├── sf_push.py              # 按月×平台导出并推送主项目(唯一出口)
+│   ├── sf_import_bili_history.py # B站历史基线合并导入(xlsx → DB)
 │   ├── sf_migrate_assets.py    # 一次性存量迁移(资产落盘,仅 v1.2.0 用)
 │   ├── sf_migrate_metric_names.py # 一次性指标命名归一(仅 v1.3.0 用)
 │   ├── build-sf-report.py      # 采集成果 Word 报告生成器
@@ -43,6 +45,7 @@ AQi-channel 的**独立数据采集工作区**。从 B站 / 抖音 / 小红书�
 ├── data/
 │   ├── sq_metrics.db           # 主数据库(SQLite,真实后台数据,已剥离原始全文)
 │   ├── assets/                 # ★ 独立资产:原始接口响应全文,按 {YYYY_MM}_{platform}/ 归档
+│   ├── imports/                # 历史导入数据源留档(xlsx 副本 + 配对报告)
 │   ├── backup/                 # DB 版本备份(迭代 schema 前生成)
 │   └── fetcher/sessions/       # 三平台登录会话(bilibili/douyin/xiaohongshu.json)
 ├── export/                     # 交付物:{YYYY_MM}_{platform}/ 分目录(manifest + 4 数据文件)
@@ -83,11 +86,15 @@ SF 抓取器 ─┬─► 原始响应全文 ─► data/assets/{YYYY_MM}_{platf
 | 表 | 用途 |
 |---|---|
 | `videos` | 稿件主表(platform / video_key / title / published_at / url / series_tag) |
-| `metrics_snapshots` | 指标快照(snapshot_type: cumulative / deep / T7;播放/点赞/收藏/评论/分享/投币/弹幕/完播率/5s完播/封面点击/2s跳出/平均时长/涨粉/互动率…) |
+| `metrics_snapshots` | 指标快照(snapshot_type: cumulative / deep / T7;播放/点赞/收藏/评论/分享/投币/弹幕/完播率/5s完播/封面点击/2s跳出/平均时长/涨粉/互动率…);`source` 标记来源,`captured_at` 为**数据实际时点**(导入历史数据时必须显式指定) |
 | `metric_series` | **通用趋势表**(任意指标逐日/逐小时:播放/点赞/评论/收藏/分享/涨粉…,每日增量) |
 | `audience_snapshots` | 观众画像(性别/年龄/城市/兴趣/来源,JSON 完整保留) |
 | `api_archives` | **接口存档索引**(v1.2.0 起原文剥离为资产文件,本表存元数据 + `asset_path` 指针) |
 | `daily_series` | 旧版逐日播放表(兼容保留) |
+
+**两类数据的边界(v1.4.0)**:`videos.video_key` 为 BV 号的是平台真实稿件;
+以 `xlsx-{YYYYMMDDHHMMSS}` 开头的是导入时无法匹配到后台的**已删除稿件**
+(仅 3 条,见 VERSION_HISTORY v1.4.0)。
 
 **抓取策略(全量原则)**:拦截页面所有 JSON 接口 → ①原文全部落盘
 `data/assets/`(独立资产,防遗漏可回溯) ②可解析的结构化入库(快照/趋势/画像)。
@@ -165,9 +172,20 @@ python sf_xiaohongshu.py --deep --id <笔记ID>       # 单篇深度
 ```bash
 python bili_audit.py         # B站全量校验:DB vs 接口原文,54 项/条(全量不抽查)
 python bili_audit.py --csv out.csv   # 同时导出明细
+python bili_import_audit.py  # B站历史导入数据全量核对(2305 项,反向链路独立验证)
 python xhs_audit.py          # 小红书全量校验:DB 每条记录 vs 原始存档,输出不一致
 python xhs_reparse.py        # 小红书重解析:从 api_archives 资产恢复被覆盖/错误的数据
 ```
+
+### 历史数据合并导入(B站,v1.4.0)
+```bash
+cd SF
+python sf_import_bili_history.py --dry-run   # 只配对出报告,不写库
+python sf_import_bili_history.py             # 正式导入(幂等,可安全重跑)
+python bili_import_audit.py                  # 导入后必跑:全量核对
+```
+数据源:主项目人工导出的 `AQi-channel/data/B站后台视频数据.xlsx`(231 条,无 BV 号)。
+脚本按发布时间(北京时间,秒级)匹配补 BV 号后入库,留档至 `data/imports/`。
 
 ### 查看与导出
 ```bash
@@ -175,6 +193,27 @@ python sf_fetch.py status              # 库内稿件清单
 python sf_fetch.py export --xlsx       # 导出 xlsx
 python sf_fetch.py export --json       # 导出 JSON
 ```
+
+### 数据质量:快照来源标记(`metrics_snapshots.source`)
+
+交付物与 DB 中的每条快照都带 `source`,消费方**必须**据此判断可用性:
+
+| source | 含义 | 精度 |
+|---|---|---|
+| `api` | SF 抓取器从创作后台接口实抓 | **精确值**;含趋势/画像/完播/互动等全部深度指标 |
+| `import_xlsx` | 由人工导出的 xlsx 合并导入(v1.4.0,B站 230 条) | **近似值**;详见下 |
+| `page` / `manual` | 页面解析 / 人工录入 | 视来源而定 |
+
+**`import_xlsx` 精度声明(重要)**:
+
+- ≥1万 的数值精度只到千位 —— 实测 202 个 ≥1万 播放值 100% 能被 1000 整除、0 反例
+  (点赞 51/51、收藏 35/35、投币 2/2 同规律),即存在 **±500 量级取整误差**;
+  <1万 的数值为精确值。
+- 仅 2026-08-01 单一快照时点,**无**趋势/画像/完播率/互动率/涨粉。
+- 交叉校验可信:对同时有两侧数据的 `BV1rnaJzpEFv`,xlsx(8-01) vs API(8-11) ——
+  弹幕 316/316、评论 120/120、分享 144/144 完全一致,播放 132,000 vs 131,942(差 0.04%)。
+- 另注:B站后台 `overview` 接口的 `play_avg_duration` **恒为 0**,`avg_duration`
+  真实值只在 `graph` 接口(`duration_info.avg_play_time_int`)。
 
 ### 推送快照到主项目(唯一出口,v1.2.0 按月×平台)
 ```bash
@@ -205,7 +244,7 @@ python build-sf-report.py --bv BV1XXXX [--out 输出路径]
 
 ## 8. 命名规范
 
-- 采集器统一命名 **SF (Super Fetcher) v1.2**
+- 采集器统一命名 **SF (Super Fetcher) v1.4**
 - 模块前缀 `sf_`;历史名称 `sq_fetch_*` 已废弃(2026-08-12 拆分时更名)
 - 小红书专项工具保留 `xhs_` 前缀(xhs_audit / xhs_reparse)
 

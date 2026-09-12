@@ -205,8 +205,14 @@ class DB:
             return c.execute("SELECT * FROM videos ORDER BY published_at DESC").fetchall()
 
     # ── snapshots ──
-    def add_snapshot(self, video_id, snapshot_type, metrics, source="page"):
-        """metrics: dict of 标准字段(仅含非空值)"""
+    def add_snapshot(self, video_id, snapshot_type, metrics, source="page",
+                     captured_at=None):
+        """metrics: dict of 标准字段(仅含非空值)。
+
+        captured_at: 快照时点(YYYY-MM-DD HH:MM:SS)。缺省取当前时间。
+        导入历史数据时必须显式指定「数据实际时点」,否则交付物 manifest 的
+        data_through 会误报为导入时刻,破坏「复盘只用揭晓时点前快照」的审计前提。
+        """
         keys = [
             "views", "likes", "favorites", "comments", "shares", "coins",
             "danmaku", "finish_rate", "finish5_rate", "cover_ctr",
@@ -218,6 +224,9 @@ class DB:
             "homepage_visit", "fan_view_rate",
         ]
         cols, vals = ["video_id", "snapshot_type", "source"], [video_id, snapshot_type, source]
+        if captured_at:
+            cols.append("captured_at")
+            vals.append(captured_at)
         for k in keys:
             if k in metrics and metrics[k] is not None:
                 cols.append(k)

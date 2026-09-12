@@ -104,9 +104,20 @@ def _get_cid(bvid: str):
         return None
 
 
-def _ts_to_date(ts) -> str:
+# B站后台所有统计口径固定为北京时间(UTC+8)。显式按 +8 换算,不依赖本机时区,
+# 避免换机/跨时区执行时日期漂移一天。
+TZ_CN = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _ts_to_date(ts, full: bool = False) -> str:
+    """时间戳 → 日期字符串。
+
+    full=False → "YYYY-MM-DD"(入库用的日期口径,保持与既有记录一致)
+    full=True  → "YYYY-MM-DD HH:MM:SS"(完整时间,用于与外部导出列表精确配对)
+    """
     try:
-        return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+        dt = datetime.datetime.fromtimestamp(int(ts), TZ_CN)
+        return dt.strftime("%Y-%m-%d %H:%M:%S" if full else "%Y-%m-%d")
     except (ValueError, TypeError):
         return str(ts)
 
@@ -401,6 +412,9 @@ def list_archives(headless: bool = True, ps: int = 50, status: str = ARCHIVE_STA
                     "title": a.get("title"),
                     "ptime": ptime,
                     "published_at": _ts_to_date(ptime) if ptime else None,
+                    # 完整时间(北京时间,秒级):用于与外部导出列表按发布时间精确配对,
+                    # 仅精确到日的 published_at 无法区分同日多条稿件。
+                    "published_at_full": _ts_to_date(ptime, full=True) if ptime else None,
                     "ctime": a.get("ctime"),
                     "state": a.get("state"),
                     "state_desc": a.get("state_desc") or STATE_DESC.get(a.get("state"), ""),
@@ -756,7 +770,8 @@ if __name__ == "__main__":
             print(f"已写入: {out}")
         else:
             for it in result:
-                print(f"  {it['published_at']}  {it['bvid']}  [{it['state_desc']}]  {it['title']}")
+                print(f"  {it['published_at_full']}  {it['bvid']}  "
+                      f"[{it['state_desc']}]  {it['title']}")
         sys.exit(0)
 
     target = args.url or args.bv

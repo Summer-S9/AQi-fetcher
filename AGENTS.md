@@ -19,6 +19,7 @@ agent(Codex / DeepSeek / Claude / 其他)必须优先遵守。
 | 迭代/升级 | `VERSION_HISTORY.md`(历史版本)+ `README.md` 对应章节 |
 | 小红书数据修复 | `SF/xhs_audit.py`、`SF/xhs_reparse.py` 文件头说明 |
 | B站抓取/补抓/校验 | `SF/sf_bilibili.py`(`--list`/`--sync`)、`SF/bili_audit.py` 文件头说明 |
+| B站历史数据合并/导入 | `SF/sf_import_bili_history.py`、`SF/bili_import_audit.py` 文件头说明 |
 
 ## 隔离铁律(最重要,不可违反)
 
@@ -37,6 +38,28 @@ agent(Codex / DeepSeek / Claude / 其他)必须优先遵守。
 - `data/assets/` 是原始接口响应全文(按抓取月份归档),含平台返回的 token 等字段,不得外泄、不得入库。
 - `data/backup/` 是 DB 版本备份,含真实后台数据,同 `sq_metrics.db` 管理。
 - `data/fetcher/sessions/*.json` 是登录会话,含 cookie,等同于账号凭证,不得外泄。
+- `data/imports/` 是历史数据源留档(人工导出的 xlsx 副本 + 配对报告),含真实后台数据,同 `sq_metrics.db` 管理。
+
+## 快照来源与精度(消费方必读)
+
+`metrics_snapshots.source` 标记每条快照的来源,**不得省略、不得篡改**:
+
+| source | 含义 | 精度 |
+|---|---|---|
+| `api` | 抓取器从创作后台接口实抓 | 精确值,含全部深度指标 |
+| `import_xlsx` | 人工导出的 xlsx 合并导入(v1.4.0,B站 230 条) | **近似值**,见下 |
+| `page` / `manual` | 页面解析 / 人工录入 | 视来源而定 |
+
+`import_xlsx` 精度(实测结论,勿当精确值用):
+
+1. ≥1万 的数值精度只到千位(202/202 个 ≥1万 播放值均能被 1000 整除,0 反例),
+   存在 **±500 量级取整误差**;<1万 的数值精确。
+2. 只有 2026-08-01 单一快照时点,**无**趋势/画像/完播率/互动率/涨粉。
+3. 导入时必须显式传 `captured_at`(数据实际时点),否则交付物 `data_through` 误报。
+4. 与 `api` 快照同时存在时,交付层取 `captured_at` 最新一条,口径正确。
+
+另:`videos.video_key` 以 `xlsx-` 开头的是**无法匹配后台的已删除稿件**(仅 3 条),
+不是平台真实 BV 号,消费方不应据此访问 B站。
 - 登录/抓取是低频手动触发,已加随机延迟;不得高频请求触发风控。
 - 平台改版可能导致选择器失效,需按页面结构调整解析逻辑,并在 VERSION_HISTORY 记录。
 
@@ -117,6 +140,11 @@ cd SF && python sf_bilibili.py --sync --since 2026-08-01  # 补抓该日之后�
 # B站全量校验(抓取后必跑;全量核对,不抽查)
 cd SF && python bili_audit.py
 cd SF && python bili_audit.py --csv out.csv            # 同时导出明细
+
+# B站历史基线合并导入(v1.4.0;幂等,可安全重跑)
+cd SF && python sf_import_bili_history.py --dry-run    # 只配对出报告,不写库
+cd SF && python sf_import_bili_history.py              # 正式导入
+cd SF && python bili_import_audit.py                   # 导入后必跑:全量核对
 
 # 小红书全量校验(改动后必跑)
 cd SF && python xhs_audit.py
